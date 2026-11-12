@@ -140,11 +140,14 @@ impl Task for LightMemoTask {
         }
         let _gate = crate::publication_gate::acquire_read(&self.db_path, &["*".into()])
             .map_err(Error::from_reason)?;
-        let mut resident = self.table.lock()
-            .map_err(|_| Error::from_reason("Global Chunk table lock poisoned"))?;
+        // Held only until the routing search; snapshot consistency comes from
+        // this query's own read transaction, not from the table lock.
+        let mut guard = Some(self.table.lock()
+            .map_err(|_| Error::from_reason("Global Chunk table lock poisoned"))?);
         let directory = std::path::Path::new(&self.db_path).parent().unwrap();
         let mut output = crate::storage::with_registered_read_transaction(
             &self.db_path, |connection| {
+                let resident = &mut **guard.as_mut().unwrap();
                 let generation = crate::storage::read_generation(connection)?;
                 if resident.as_ref().is_some_and(|table|
                     !table.matches_model(self.dimension, &plan.model_sig)) {
@@ -165,6 +168,9 @@ impl Task for LightMemoTask {
                     scope_chunks += usize::from(admitted);
                     admitted
                 })?;
+                // Nothing below reads the table; release it for concurrent queries.
+                table.last_used = std::time::Instant::now();
+                drop(guard.take());
                 let vectors = crate::storage::load_vectors_by_ids(connection, "chunks", &ids, self.dimension)?;
                 let mut candidates = ids.into_iter().filter_map(|id| {
                     vectors.get(&id).map(|vector| json!({
@@ -298,7 +304,6 @@ impl Task for LightMemoTask {
         ).map_err(Error::from_reason)?;
         // Queries only synchronize memory routing. Snapshot publication belongs
         // to the independently scheduled, policy-gated checkpoint task.
-        resident.as_mut().unwrap().last_used = std::time::Instant::now();
         output["diagnostics"]["totalMs"] = json!(started.elapsed().as_secs_f64()*1000.);
         Ok(output.to_string())
     }
