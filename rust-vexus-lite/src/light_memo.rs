@@ -541,3 +541,196 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod lock_release_tests {
+    use super::*;
+    use crate::storage::{SqliteStorageEngine, StorageOptions, WriteReceipt};
+    use std::{cell::RefCell, sync::{mpsc, Barrier}, thread, time::Duration};
+
+    const LIMIT: Duration = Duration::from_secs(30);
+    type Pause = (mpsc::Sender<()>, mpsc::Receiver<()>);
+    thread_local! { static PAUSE: RefCell<Option<Pause>> = const { RefCell::new(None) }; }
+
+    // Bound setup, joins and shutdown too, so a lock regression fails instead of hanging.
+    fn within(work: impl FnOnce() + Send + 'static) {
+        let (send, receive) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = send.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)));
+        });
+        if let Err(panic) = receive.recv_timeout(Duration::from_secs(60)).expect("scenario timed out") {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    struct Fixture {
+        root: std::path::PathBuf,
+        db: String,
+        storage: SqliteStorageEngine,
+        table: Arc<Mutex<Option<GlobalChunks>>>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let root = std::env::temp_dir().join(format!("lightmemo-lock-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            let db = root.join("test.sqlite").to_string_lossy().into_owned();
+            let (storage, _) = SqliteStorageEngine::open_and_init(&db, StorageOptions::default()).unwrap();
+            storage.submit_write(|tx| {
+                tx.execute_batch("INSERT INTO files(id,path,diary_name,checksum,mtime,size)
+                    VALUES (1,'Diary/base.txt','Diary','fixture',0,0)").map_err(|e| e.to_string())?;
+                for id in 1..=512 {
+                    let bytes = (0..65).flat_map(|d| {
+                        ((((id * 131 + d * 17 + id * d * 3) % 997) as f32 - 498.) / 499.).to_le_bytes()
+                    }).collect::<Vec<_>>();
+                    let text = format!("[2026-11-14] Alice row {id}\nalpha {} context",
+                        if id % 2 == 0 { "beta" } else { "diary" });
+                    tx.execute("INSERT INTO chunks(id,file_id,chunk_index,content,vector)
+                        VALUES (?1,1,?1,?2,?3)", rusqlite::params![id, text, bytes])
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(receipt())
+            }).unwrap();
+            // Hold all four pool connections simultaneously; otherwise LIFO reuses one.
+            let barrier = Arc::new(Barrier::new(4));
+            let workers = (0..4).map(|_| {
+                let (storage, barrier) = (storage.clone(), barrier.clone());
+                thread::spawn(move || storage.read(|connection| {
+                    // No user pointer: only the designated query thread pauses via TLS.
+                    assert_eq!(unsafe { rusqlite::ffi::sqlite3_set_authorizer(
+                        connection.handle(), Some(authorizer), std::ptr::null_mut()) }, rusqlite::ffi::SQLITE_OK);
+                    barrier.wait();
+                    Ok(())
+                }).unwrap())
+            }).collect::<Vec<_>>();
+            for worker in workers { worker.join().unwrap(); }
+            let fixture = Self { root, db, storage, table: Arc::new(Mutex::new(None)) };
+            run(fixture.task(0)); // Warm routing so reference and concurrent diagnostics agree.
+            fixture
+        }
+
+        fn task(&self, query: usize) -> LightMemoTask {
+            LightMemoTask {
+                db_path: self.db.clone(), dimension: 65,
+                query: (0..65).map(|d| (((d * 19 + query * 7) % 101) as f32 - 50.) / 51.).collect(),
+                plan_json: json!({"scope":{"searchAll":true},"modelSig":"lock-test",
+                    "engineMode":"knn","k":20,"candidateK":256,"useBm25":true,
+                    // Two distinct terms avoid floating-point summation-order ambiguity.
+                    "queryTokens":["alpha","beta","alpha",""]}).to_string(),
+                table: self.table.clone(), runtime: Arc::new(MemoRuntime::new()), observation: None,
+            }
+        }
+
+        fn finish(self) {
+            self.storage.shutdown().unwrap();
+            assert_eq!(self.root.parent().unwrap(), std::env::temp_dir());
+            assert!(self.root.file_name().unwrap().to_string_lossy().starts_with("lightmemo-lock-"));
+            std::fs::remove_dir_all(self.root).unwrap();
+        }
+    }
+
+    fn receipt() -> WriteReceipt {
+        WriteReceipt { operation: "lock-test".into(), database_generation: 0, facts_changed: true }
+    }
+
+    fn run(mut task: LightMemoTask) -> Value {
+        let mut value: Value = serde_json::from_str(&task.compute().unwrap()).unwrap();
+        assert!(value["diagnostics"]["totalMs"].as_f64().unwrap() >= 0.);
+        value["diagnostics"].as_object_mut().unwrap().remove("totalMs");
+        value // Compare every field except elapsed wall time.
+    }
+
+    // files.path is read only by post-routing hydration, never table synchronization.
+    unsafe extern "C" fn authorizer(
+        _: *mut std::ffi::c_void, action: i32, table: *const std::ffi::c_char,
+        column: *const std::ffi::c_char, _: *const std::ffi::c_char, _: *const std::ffi::c_char,
+    ) -> i32 {
+        if action == rusqlite::ffi::SQLITE_READ && !table.is_null() && !column.is_null()
+            && std::ffi::CStr::from_ptr(table).to_bytes() == b"files"
+            && std::ffi::CStr::from_ptr(column).to_bytes() == b"path" {
+            if let Some((entered, resume)) = PAUSE.with(|slot| slot.borrow_mut().take()) {
+                if entered.send(()).is_err() || resume.recv_timeout(LIMIT).is_err() {
+                    return rusqlite::ffi::SQLITE_DENY;
+                }
+            }
+        }
+        rusqlite::ffi::SQLITE_OK
+    }
+
+    fn paused(task: LightMemoTask) -> (mpsc::Sender<()>, thread::JoinHandle<Value>) {
+        let (entered, receive) = mpsc::channel();
+        let (resume, wait) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            PAUSE.with(|slot| *slot.borrow_mut() = Some((entered, wait)));
+            run(task)
+        });
+        receive.recv_timeout(LIMIT).expect("query did not reach hydration");
+        (resume, worker)
+    }
+
+    #[test]
+    fn hydration_keeps_old_snapshot_while_another_query_synchronizes_new_generation() {
+        within(|| {
+            let fixture = Fixture::new();
+            let expected = run(fixture.task(0));
+            assert_eq!(expected["results"].as_array().unwrap().len(), 20);
+            let (resume, worker) = paused(fixture.task(0));
+            // Deliberately bypass the exclusive publication gate to stress WAL snapshots.
+            let generation = fixture.storage.submit_write(|tx| {
+                let bytes = (0..65).flat_map(|d| (d as f32 / 65.).to_le_bytes()).collect::<Vec<_>>();
+                tx.execute("UPDATE chunks SET vector=?1, content=content || ' generation-1'", [bytes])
+                    .map_err(|e| e.to_string())?;
+                Ok(receipt())
+            }).unwrap().database_generation;
+            let newer = run(fixture.task(0)); // Must finish before the first query resumes.
+            assert_eq!(newer["diagnostics"]["databaseGeneration"], generation);
+            assert_ne!(newer["diagnostics"]["databaseGeneration"], expected["diagnostics"]["databaseGeneration"]);
+            assert!(newer["diagnostics"]["synchronizedRows"].as_u64().unwrap() > 0);
+            assert!(newer["results"].as_array().unwrap().iter().all(|row|
+                row["text"].as_str().unwrap().ends_with(" generation-1")));
+            resume.send(()).unwrap();
+            assert_eq!(worker.join().unwrap(), expected);
+            fixture.finish();
+        });
+    }
+
+    #[test]
+    fn eight_concurrent_queries_match_serial_results_for_twelve_rounds() {
+        within(|| {
+            let fixture = Fixture::new();
+            let expected = (0..8).map(|q| run(fixture.task(q))).collect::<Vec<_>>();
+            for round in 0..12 {
+                let barrier = Arc::new(Barrier::new(8));
+                let workers = (0..8).map(|q| {
+                    let (task, barrier) = (fixture.task(q), barrier.clone());
+                    thread::spawn(move || { barrier.wait(); run(task) })
+                }).collect::<Vec<_>>();
+                for (q, worker) in workers.into_iter().enumerate() {
+                    assert_eq!(worker.join().unwrap(), expected[q], "round={round} query={q}");
+                }
+            }
+            fixture.finish();
+        });
+    }
+
+    #[test]
+    fn post_route_poison_spares_inflight_query_and_rejects_new_query() {
+        within(|| {
+            let fixture = Fixture::new();
+            let expected = run(fixture.task(0));
+            let (resume, worker) = paused(fixture.task(0));
+            let table = fixture.table.clone();
+            assert!(std::panic::catch_unwind(move || {
+                let _guard = table.lock().unwrap();
+                panic!("intentional post-route poison injection");
+            }).is_err());
+            resume.send(()).unwrap();
+            assert_eq!(worker.join().unwrap(), expected);
+            let error = fixture.task(0).compute().unwrap_err();
+            assert_eq!(error.reason, "Global Chunk table lock poisoned");
+            assert_eq!(error.status, napi::Status::GenericFailure);
+            fixture.finish();
+        });
+    }
+}
