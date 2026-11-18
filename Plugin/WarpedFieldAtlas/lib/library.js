@@ -97,6 +97,22 @@ function openLibrary(directory) {
         const payload = JSON.parse(zlib.gunzipSync(Buffer.from(row.payload)).toString('utf8'));
         const transport = payload.sharedTransport;
         if (!transport || !Array.isArray(transport.nodeIds) || !Array.isArray(transport.rowOffsets)) return null;
+        // only use directional file contributions in this artifact, never infer them from matching text.
+        const evidence = new Map();
+        const filesById = new Map(db.all('SELECT id, diary_name AS diary, path FROM files')
+            .map(file => [file.id, { diary: file.diary, name: path.win32.basename(file.path || '') }]));
+        for (const [key, contributions] of payload.provenanceView?.edges || []) {
+            if (!Array.isArray(contributions)) continue;
+            let first, second;
+            for (const row of contributions) {
+                if (!Array.isArray(row)) continue;
+                const fileId = row[0], mass = row[row.length - 1];
+                if (!filesById.has(fileId) || !Number.isFinite(mass) || mass <= 0) continue;
+                if (!first || mass > first.mass) { second = first; first = { fileId, mass }; }
+                else if (!second || mass > second.mass) second = { fileId, mass };
+            }
+            if (first) evidence.set(key, [first, second].filter(Boolean).map(item => filesById.get(item.fileId)));
+        }
         const wormholes = new Set(Array.isArray(payload.wormholeView) ? payload.wormholeView : []);
         return {
             ids: transport.nodeIds,
@@ -104,6 +120,7 @@ function openLibrary(directory) {
             targets: transport.targetIndices,
             weights: transport.weights,
             inbound: new Map(payload.inboundMassView || []),
+            sources: (from, to) => evidence.get(`${from}:${to}`) || [],
             isWormhole: (from, to) => wormholes.has(`${from}:${to}`),
         };
     }

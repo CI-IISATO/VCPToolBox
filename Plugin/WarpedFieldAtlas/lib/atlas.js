@@ -374,15 +374,16 @@ function createAtlas({
         let river = null;
         if (network && network.position.has(id)) {
             const p = network.position.get(id);
-            const describe = (other, weight, wormhole) => {
+            const describe = (other, weight, from, to) => {
                 const otherId = network.ids[other];
-                return { id: otherId, name: names().get(otherId) || `Tag#${otherId}`, index: f.indexOf.get(otherId) ?? null, weight: round(weight, 4), wormhole };
+                return { id: otherId, name: names().get(otherId) || `Tag#${otherId}`, index: f.indexOf.get(otherId) ?? null, weight: round(weight, 4),
+                    wormhole: network.isWormhole(from, to), sources: network.sources(from, to) };
             };
             const outgoing = [];
             for (let e = network.offsets[p]; e < network.offsets[p + 1]; e++) {
-                outgoing.push(describe(network.targets[e], network.weights[e], network.isWormhole(id, network.ids[network.targets[e]])));
+                outgoing.push(describe(network.targets[e], network.weights[e], id, network.ids[network.targets[e]]));
             }
-            const incoming = network.incoming[p].map(([source, weight]) => describe(source, weight, network.isWormhole(network.ids[source], id)));
+            const incoming = network.incoming[p].map(([source, weight]) => describe(source, weight, network.ids[source], id));
             const byWeight = (a, b) => b.weight - a.weight || a.id - b.id;
             river = {
                 outgoing: outgoing.sort(byWeight), incoming: incoming.sort(byWeight),

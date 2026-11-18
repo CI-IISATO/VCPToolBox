@@ -38,6 +38,7 @@ const atlas = createAtlas({
 });
 const ASSETS = new Map([
     ['/ui/atlas-app.js', ['atlas-app.js', 'text/javascript']],
+    ['/ui/metric-slice.mjs', ['metric-slice.mjs', 'text/javascript']],
     ['/ui/atlas.css', ['atlas.css', 'text/css']],
 ]);
 
